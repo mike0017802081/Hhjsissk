@@ -1,0 +1,484 @@
+name: Mobile Dev Environment
+on:
+  workflow_dispatch:
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            xvfb x11vnc novnc python3-aiohttp \
+            android-tools-fsutils wget curl
+          sudo apt-get install -y libpulse0 2>/dev/null || true
+
+      - name: Accept SDK licenses
+        run: yes "" | sdkmanager --licenses >/dev/null 2>&1 || true
+
+      - name: Install Android components
+        run: |
+          sdkmanager \
+            "emulator" \
+            "platform-tools" \
+            "platforms;android-33" \
+            "system-images;android-33;google_apis;x86_64" \
+            "ndk;25.2.9519653" \
+            2>&1 | grep -v "^Info:"
+
+      - name: Patch system image
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          SYS_IMG="$SDK/system-images/android-33/google_apis/x86_64/system.img"
+          MNT=/mnt/asys
+
+          echo "[patch] Image: $SYS_IMG"
+          [ -f "$SYS_IMG" ] || { echo "[patch] system.img not found"; exit 1; }
+
+          sudo mkdir -p "$MNT"
+          sudo simg2img "$SYS_IMG" /tmp/sys.raw 2>/dev/null \
+            || sudo cp "$SYS_IMG" /tmp/sys.raw
+          sudo mount -o loop,rw /tmp/sys.raw "$MNT" 2>/dev/null \
+            || sudo mount -o loop /tmp/sys.raw "$MNT"
+          sudo mount -o remount,rw "$MNT" 2>/dev/null || true
+
+          BP=""
+          for c in "$MNT/build.prop" "$MNT/system/build.prop"; do
+            [ -f "$c" ] && { BP="$c"; break; }
+          done
+          [ -n "$BP" ] || { echo "[patch] build.prop missing"; sudo umount "$MNT"; exit 1; }
+          echo "[patch] Patching: $BP"
+          sudo cp "$BP" "${BP}.orig"
+
+          sp() {
+            local k="$1" v="$2"
+            if sudo grep -qE "^${k}=" "$BP"; then
+              sudo sed -i "s|^${k}=.*|${k}=${v}|" "$BP"
+            else
+              echo "${k}=${v}" | sudo tee -a "$BP" >/dev/null
+            fi
+          }
+
+          sp ro.product.model                "SM-S911B"
+          sp ro.product.name                 "dm1qxxx"
+          sp ro.product.device               "dm1q"
+          sp ro.product.brand                "samsung"
+          sp ro.product.manufacturer         "samsung"
+          sp ro.product.odm.brand            "samsung"
+          sp ro.product.odm.manufacturer     "samsung"
+          sp ro.product.system.brand         "samsung"
+          sp ro.product.system.manufacturer  "samsung"
+          sp ro.product.vendor.brand         "samsung"
+          sp ro.product.vendor.manufacturer  "samsung"
+          sp ro.board.platform               "kalama"
+          sp ro.hardware                     "qcom"
+          sp ro.hardware.chipname            "SM8550"
+          sp ro.product.cpu.abi              "arm64-v8a"
+          sp ro.product.cpu.abilist          "arm64-v8a,armeabi-v7a,armeabi"
+          sp ro.product.cpu.abilist32        "armeabi-v7a,armeabi"
+          sp ro.product.cpu.abilist64        "arm64-v8a"
+          sp ro.hardware.vulkan              "adreno"
+          sp ro.hardware.egl                 "adreno"
+          sp ro.gfx.driver.0                "com.qualcomm.qti.gpudrivers.kalama.api33"
+          sp ro.vendor.extension_library     "libqti-perfd-client.so"
+          sp ro.build.fingerprint \
+            "samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXS3DWL1:user/release-keys"
+          sp ro.vendor.build.fingerprint \
+            "samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXS3DWL1:user/release-keys"
+          sp ro.build.description \
+            "dm1qxxx-user 13 TP1A.220624.014 S911BXXS3DWL1 release-keys"
+          sp ro.build.tags                   "release-keys"
+          sp ro.build.type                   "user"
+          sp ro.build.flavor                 "dm1qxxx-user"
+          sp ro.build.host                   "SWDD7709"
+          sp ro.build.user                   "dpi"
+          sp ro.build.version.security_patch "2023-12-01"
+          sp ro.sf.lcd_density               "393"
+          sp ro.kernel.qemu                  "0"
+          sp ro.kernel.android.qemud         ""
+          sp ro.boot.flash.locked            "1"
+          sp ro.secure                       "1"
+          sp ro.debuggable                   "0"
+          sp ro.boot.verifiedbootstate       "green"
+          sp ro.boot.vbmeta.device_state     "locked"
+
+          echo "[patch] Done"
+          sudo umount "$MNT"
+          sudo img2simg /tmp/sys.raw "$SYS_IMG" 2>/dev/null \
+            || sudo cp /tmp/sys.raw "$SYS_IMG"
+          sudo rm -f /tmp/sys.raw
+
+      - name: Create AVD
+        run: |
+          echo "no" | avdmanager create avd \
+            --name "main" \
+            --abi "google_apis/x86_64" \
+            --package "system-images;android-33;google_apis;x86_64" \
+            --device "pixel_6" \
+            --force
+
+          CFG="$HOME/.android/avd/main.avd/config.ini"
+          printf '%s\n' \
+            "hw.cpu.ncore=4" \
+            "hw.ramSize=8192" \
+            "vm.heapSize=1024" \
+            "hw.gpu.enabled=yes" \
+            "hw.gpu.mode=swiftshader_indirect" \
+            "hw.lcd.width=1080" \
+            "hw.lcd.height=2340" \
+            "hw.lcd.density=393" \
+            "hw.keyboard=yes" \
+            "hw.mainKeys=no" \
+            "hw.sensors.proximity=yes" \
+            "hw.sensors.acceleration=yes" \
+            "hw.sensors.gyroscope=yes" \
+            "hw.sensors.magnetic_field=yes" \
+            "hw.camera.back=none" \
+            "hw.camera.front=none" \
+            "hw.initialOrientation=portrait" >> "$CFG"
+
+      - name: Start display and VNC
+        run: |
+          Xvfb :1 -screen 0 1920x1080x24 -ac +extension GLX +render -noreset &
+          sleep 2
+          DISPLAY=:1 x11vnc \
+            -display :1 \
+            -listen 127.0.0.1 \
+            -nopw \
+            -forever \
+            -shared \
+            -noncache \
+            -noxdamage \
+            -bg \
+            -o /tmp/x11vnc.log \
+            -rfbport 5900
+          sleep 1
+          echo "[display] VNC ready on 127.0.0.1:5900"
+
+      - name: Write and start access gate
+        run: |
+          python3 -c "
+          import hashlib, os
+          p = bytes([87,105,110,100,111,119,115,82,68,80,50,48,50,54,64])
+          os.makedirs('/tmp/.auth', exist_ok=True)
+          open('/tmp/.auth/.k','w').write(hashlib.sha256(p).hexdigest())
+          " && unset p
+
+          cat > /tmp/gate.py << 'PYEOF'
+          import asyncio, hashlib, os, secrets, time
+          from pathlib import Path
+          from aiohttp import web, WSMsgType
+
+          PORT      = 8080
+          VNC_HOST  = "127.0.0.1"
+          VNC_PORT  = 5900
+          KEY_FILE  = Path("/tmp/.auth/.k")
+          SESSION_S = 7 * 3600
+
+          NOVNC = next(
+              (p for p in [Path("/usr/share/novnc"), Path("/usr/local/share/novnc")]
+               if p.is_dir()),
+              Path("/usr/share/novnc"),
+          )
+
+          _sessions: dict[str, float] = {}
+
+          def _expected() -> str:
+              return KEY_FILE.read_text().strip()
+
+          def _verify(pw: str) -> bool:
+              try:
+                  return secrets.compare_digest(
+                      hashlib.sha256(pw.encode()).hexdigest(), _expected()
+                  )
+              except Exception:
+                  return False
+
+          def _new_token() -> str:
+              tok = secrets.token_hex(32)
+              _sessions[tok] = time.monotonic() + SESSION_S
+              return tok
+
+          def _valid(tok) -> bool:
+              if not tok:
+                  return False
+              exp = _sessions.get(tok)
+              return exp is not None and time.monotonic() < exp
+
+          LOGIN_HTML = """<!DOCTYPE html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Secure Terminal</title>
+          <style>
+          *{box-sizing:border-box;margin:0;padding:0}
+          body{background:#0d1117;min-height:100vh;display:flex;align-items:center;
+               justify-content:center;font-family:-apple-system,BlinkMacSystemFont,
+               'Segoe UI',Roboto,sans-serif;color:#c9d1d9}
+          .card{background:#161b22;border:1px solid #30363d;border-radius:12px;
+                padding:40px 48px;width:380px;box-shadow:0 8px 32px rgba(0,0,0,.5)}
+          h1{text-align:center;font-size:1.2rem;color:#58a6ff;letter-spacing:1px;
+             margin-bottom:32px;font-weight:600}
+          label{display:block;font-size:.78rem;color:#8b949e;margin-bottom:5px;
+                text-transform:uppercase;letter-spacing:.5px}
+          input{display:block;width:100%;padding:11px 14px;background:#0d1117;
+                border:1px solid #30363d;border-radius:6px;color:#e6edf3;
+                font-size:1rem;margin-bottom:22px;outline:none;transition:border .15s}
+          input:focus{border-color:#58a6ff;box-shadow:0 0 0 3px rgba(88,166,255,.12)}
+          button{width:100%;padding:11px;background:#238636;border:none;
+                 border-radius:6px;color:#fff;font-size:.95rem;font-weight:600;
+                 cursor:pointer;transition:background .15s}
+          button:hover:not(:disabled){background:#2ea043}
+          button:disabled{background:#21262d;color:#484f58;cursor:default}
+          .msg{margin-top:14px;font-size:.82rem;text-align:center;
+               min-height:16px;color:#f85149}
+          </style></head><body>
+          <div class="card">
+            <h1>&#9608; ACCESS TERMINAL</h1>
+            <label for="k">Authentication key</label>
+            <input type="password" id="k" placeholder="Enter access key"
+                   autocomplete="current-password" autofocus>
+            <button id="btn" onclick="go()">Connect</button>
+            <div class="msg" id="msg"></div>
+          </div>
+          <script>
+          function go(){
+            var k=document.getElementById('k').value.trim();
+            if(!k)return;
+            var btn=document.getElementById('btn');
+            var msg=document.getElementById('msg');
+            btn.disabled=true;btn.textContent='Connecting\u2026';msg.textContent='';
+            fetch('/auth',{method:'POST',headers:{'Content-Type':'application/json'},
+              body:JSON.stringify({k:k})})
+            .then(function(r){return r.json();})
+            .then(function(d){
+              if(d.ok){location.href='/view/';}
+              else{btn.disabled=false;btn.textContent='Connect';
+                   msg.textContent='Authentication failed';
+                   document.getElementById('k').value='';}
+            })
+            .catch(function(){btn.disabled=false;btn.textContent='Connect';});
+          }
+          document.getElementById('k').addEventListener('keydown',function(e){
+            if(e.key==='Enter')go();
+          });
+          </script></body></html>"""
+
+          VIEWER_HTML = """<!DOCTYPE html>
+          <html><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Remote Session</title>
+          <style>
+          *{margin:0;padding:0;box-sizing:border-box}
+          html,body{width:100%;height:100%;overflow:hidden;background:#000}
+          #screen{width:100%;height:100%}
+          #status{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
+                  color:#58a6ff;font-family:monospace;font-size:1rem;text-align:center}
+          </style></head><body>
+          <div id="screen"></div>
+          <div id="status">Connecting to session\u2026</div>
+          <script type="module">
+          import RFB from '/view/novnc/core/rfb.js';
+          var proto=location.protocol==='https:'?'wss:':'ws:';
+          var rfb=new RFB(document.getElementById('screen'),
+            proto+'//'+location.host+'/ws',{wsProtocols:['binary']});
+          rfb.scaleViewport=true;rfb.resizeSession=false;rfb.viewOnly=false;
+          rfb.addEventListener('connect',function(){
+            document.getElementById('status').style.display='none';});
+          rfb.addEventListener('disconnect',function(){
+            document.getElementById('status').textContent=
+              'Session disconnected. Reload to reconnect.';
+            document.getElementById('status').style.display='';});
+          </script></body></html>"""
+
+          CT = {".html":"text/html",".js":"application/javascript",
+                ".mjs":"application/javascript",".css":"text/css",
+                ".png":"image/png",".ico":"image/x-icon",
+                ".svg":"image/svg+xml",".woff":"font/woff",
+                ".woff2":"font/woff2",".map":"application/json",
+                ".wasm":"application/wasm"}
+
+          async def route_root(req):
+              if _valid(req.cookies.get("_vt")):
+                  raise web.HTTPFound("/view/")
+              return web.Response(text=LOGIN_HTML,content_type="text/html",charset="utf-8")
+
+          async def route_auth(req):
+              try:
+                  body=await req.json()
+                  pw=str(body.get("k",""))
+              except Exception:
+                  return web.json_response({"ok":False},status=400)
+              if not _verify(pw):
+                  await asyncio.sleep(0.75)
+                  return web.json_response({"ok":False})
+              tok=_new_token()
+              resp=web.json_response({"ok":True})
+              resp.set_cookie("_vt",tok,max_age=SESSION_S,
+                              httponly=True,samesite="Strict",path="/")
+              return resp
+
+          async def route_view(req):
+              if not _valid(req.cookies.get("_vt")):
+                  raise web.HTTPFound("/")
+              sub=req.match_info.get("sub","").lstrip("/")
+              if not sub:
+                  return web.Response(text=VIEWER_HTML,content_type="text/html",charset="utf-8")
+              if sub.startswith("novnc/"):
+                  sub=sub[6:]
+              target=(NOVNC/sub).resolve()
+              try:
+                  target.relative_to(NOVNC.resolve())
+              except ValueError:
+                  raise web.HTTPForbidden()
+              if not target.is_file():
+                  raise web.HTTPNotFound()
+              ct=CT.get(target.suffix.lower(),"application/octet-stream")
+              return web.FileResponse(target,headers={"Content-Type":ct})
+
+          async def route_ws(req):
+              if not _valid(req.cookies.get("_vt")):
+                  raise web.HTTPForbidden()
+              ws=web.WebSocketResponse(protocols=("binary",))
+              await ws.prepare(req)
+              try:
+                  reader,writer=await asyncio.open_connection(VNC_HOST,VNC_PORT)
+              except OSError:
+                  await ws.close(code=1011,message=b"VNC unavailable")
+                  return ws
+              async def _vnc_rx():
+                  try:
+                      while not ws.closed:
+                          chunk=await reader.read(65536)
+                          if not chunk:
+                              break
+                          await ws.send_bytes(chunk)
+                  finally:
+                      if not ws.closed:
+                          await ws.close()
+              async def _ws_rx():
+                  try:
+                      async for msg in ws:
+                          if msg.type==WSMsgType.BINARY:
+                              writer.write(msg.data)
+                              await writer.drain()
+                          elif msg.type in(WSMsgType.ERROR,WSMsgType.CLOSE):
+                              break
+                  finally:
+                      writer.close()
+                      try:
+                          await writer.wait_closed()
+                      except Exception:
+                          pass
+              await asyncio.gather(_vnc_rx(),_ws_rx(),return_exceptions=True)
+              return ws
+
+          def _app():
+              app=web.Application()
+              app.router.add_get("/",route_root)
+              app.router.add_post("/auth",route_auth)
+              app.router.add_get("/view/",route_view)
+              app.router.add_get(r"/view/{sub:.+}",route_view)
+              app.router.add_get("/ws",route_ws)
+              return app
+
+          if __name__=="__main__":
+              web.run_app(_app(),host="0.0.0.0",port=PORT,access_log=None,print=None)
+          PYEOF
+
+          python3 /tmp/gate.py >/tmp/gate.log 2>&1 &
+          disown
+          sleep 1
+          echo "[gate] Running on :8080"
+
+      - name: Start emulator
+        run: |
+          export DISPLAY=:1
+          nohup emulator \
+            -avd main \
+            -no-window \
+            -no-snapshot \
+            -no-audio \
+            -no-boot-anim \
+            -gpu swiftshader_indirect \
+            -cores 4 \
+            -memory 8192 \
+            -port 5554 \
+            >/tmp/emu.log 2>&1 &
+          disown
+
+          echo "[emu] Waiting for boot (3-5 min)..."
+          adb start-server
+          adb wait-for-device
+          until [ "$(adb shell getprop sys.boot_completed 2>/dev/null \
+                     | tr -d '[:space:]')" = "1" ]; do
+            sleep 5
+          done
+          echo "[emu] Booted"
+
+      - name: Apply device profile and GPU spoof
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+
+          echo "[boot] Getting root..."
+          adb root
+          sleep 2
+          adb wait-for-device
+
+          # /proc/cpuinfo → Snapdragon 8 Gen 2 Cortex topology
+          cat > /tmp/fake_cpu.txt << 'CPUEOF'
+          processor	: 0
+          Processor	: Cortex-X3 rev 1 (aarch64)
+          BogoMIPS	: 38.40
+          Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg
+          CPU implementer	: 0x41
+          CPU architecture: 8
+          CPU variant	: 0x0
+          CPU part	: 0xd4e
+          CPU revision	: 1
+
+          processor	: 1
+          Processor	: Cortex-A715 rev 0 (aarch64)
+          BogoMIPS	: 38.40
+          Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg
+          CPU implementer	: 0x41
+          CPU architecture: 8
+          CPU variant	: 0x0
+          CPU part	: 0xd44
+          CPU revision	: 0
+
+          processor	: 2
+          Processor	: Cortex-A715 rev 0 (aarch64)
+          BogoMIPS	: 38.40
+          Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg
+          CPU implementer	: 0x41
+          CPU architecture: 8
+          CPU variant	: 0x0
+          CPU part	: 0xd44
+          CPU revision	: 0
+
+          processor	: 3
+          Processor	: Cortex-A710 rev 0 (aarch64)
+          BogoMIPS	: 38.40
+          Features	: fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 sve asimdfhm dit uscat ilrcpc flagm ssbs sb paca pacg
+          CPU implementer	: 0x41
+          CPU architecture: 8
+          CPU variant	: 0x0
+          CPU part	: 0xd46
+          CPU revision	: 0
+          CPUEOF
+
+          adb push /tmp/fake_cpu.txt /data/local/tmp/.cpuinfo
+          adb shell "mount --bind /data/local/tmp/.cpuinfo /proc/cpuinfo" 2>/dev/null \
+            || echo "[boot] cpuinfo bind skipped (SELinux)"
+
+          # GPU spoof: glG
